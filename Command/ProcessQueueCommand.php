@@ -1,106 +1,168 @@
 <?php
-// namespace MauticPlugin\CustomEmailBundle\Command;
-
-// use Doctrine\DBAL\Connection;
-// use Mautic\EmailBundle\Helper\MailHelper;
-// use Symfony\Component\Console\Command\Command;
-// use Symfony\Component\Console\Input\InputInterface;
-// use Symfony\Component\Console\Output\OutputInterface;
-
-// class ProcessQueueCommand extends Command
-// {
-//     protected static $defaultName = 'customemail:process-queue';
-
-//     private Connection $connection;
-//     private MailHelper $mailerHelper;
-
-//     public function __construct(Connection $connection, MailHelper $mailerHelper)
-//     {
-//         $this->connection   = $connection;
-//         $this->mailerHelper = $mailerHelper;
-//         parent::__construct();
-//     }
-
-//     protected function configure()
-//     {
-//         $this->setDescription('Process pending custom email queue');
-//     }
-
-//     protected function execute(InputInterface $input, OutputInterface $output): int
-//     {
-//         $output->writeln('Queue command works!');
-//         return Command::SUCCESS;
-//     }
-// }
-
 namespace MauticPlugin\CustomEmailBundle\Command;
 
-use Doctrine\DBAL\Connection;
+use Doctrine\ORM\EntityManagerInterface;
 use Mautic\EmailBundle\Helper\MailHelper;
+use MauticPlugin\CustomEmailBundle\Entity\CustomEmailQueue;
+use Mautic\LeadBundle\Entity\Lead;
+use Mautic\EmailBundle\Entity\Email;
+use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 
 class ProcessQueueCommand extends Command
 {
-    protected static $defaultName = 'customemail:process-queue';
-    protected static $defaultDescription = 'Process pending custom email queue.';
+    protected function configure(): void
+    {
+        $this->setName('customemail:process-queue')
+            ->setDescription('Process pending custom email queue with dates, limits, and throttling.');
+    }
 
     public function __construct(
-        private Connection $connection,
-        private MailHelper $mailerHelper
+        private EntityManagerInterface $em,
+        private MailHelper $mailHelper,
+        private LoggerInterface $logger
     ) {
         parent::__construct();
     }
 
-    protected function configure(): void
-    {
-        $this->setDescription(self::$defaultDescription);
-    }
-
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $dailyLimit = 5;    // Fetch from plugin settings if needed
-        $delaySeconds = 3;  // Delay between emails
+        $now = new \DateTimeImmutable();
 
-        $output->writeln("<info>Processing Custom Email Queue...</info>");
+        // Get all pending items
+        $queueItems = $this->em->getRepository(CustomEmailQueue::class)
+            ->findBy(['status' => 'pending'], ['scheduledAt' => 'ASC', 'id' => 'ASC']);
 
-        $queueItems = $this->connection->fetchAllAssociative(
-            "SELECT * FROM custom_email_queue
-             WHERE status = 'pending' AND (scheduled_at IS NULL OR scheduled_at <= NOW())
-             ORDER BY id ASC
-             LIMIT $dailyLimit"
-        );
+        if (!$queueItems) {
+            $output->writeln('<info>No pending emails in the queue.</info>');
+            return Command::SUCCESS;
+        }
 
+        // Prepare counters
+        $todayStart = new \DateTimeImmutable('today');
+        $todayEnd   = (new \DateTimeImmutable('today'))->modify('+1 day');
+
+        $sentTodayByGroup = [];
+        $limitTodayByGroup = [];
+        
         foreach ($queueItems as $item) {
-            try {
-                $output->writeln("Sending to contact_id: {$item['contact_id']}");
+            $groupKey = $item->getCampaignId().':'.((string)($item->getEmailId() ?? 0));
 
-                $mailer = $this->mailerHelper->getMailer();
-                $message = (new \Swift_Message($item['subject']))
-                    ->setFrom('you@example.com') // Change this to your sender
-                    ->setTo('contact'.$item['contact_id'].'@example.com') // Replace with real contact email
-                    ->setBody($item['body']);
+            if (!array_key_exists($groupKey, $sentTodayByGroup)) {
+                // Calculate today's limit
+                $baseLimit = $item->getDailyLimit();
+                $increment = $item->getDailyIncrement() ?? 0;
+                $start     = $item->getStartDate();
 
-                $mailer->send($message);
+                if ($baseLimit && $start) {
+                    $daysSinceStart = (int)$start->diff($now)->format('%a');
+                    $calcLimit = (int)floor(
+                        $baseLimit + ($baseLimit * ($increment / 100.0) * $daysSinceStart)
+                    );
+                    $limitTodayByGroup[$groupKey] = max(1, $calcLimit);
+                } else {
+                    $limitTodayByGroup[$groupKey] = $baseLimit ?: null; // unlimited
+                }
 
-                // Mark as sent
-                $this->connection->update('custom_email_queue', [
-                    'status'  => 'sent',
-                    'sent_at' => date('Y-m-d H:i:s'),
-                ], ['id' => $item['id']]);
+                // Count already sent today
+                $q = $this->em->getRepository(CustomEmailQueue::class)->createQueryBuilder('q')
+                    ->select('COUNT(q.id)')
+                    ->where('q.campaignId = :cid')
+                    ->andWhere('q.status = :sent')
+                    ->andWhere('q.sentAt >= :start')
+                    ->andWhere('q.sentAt < :end')
+                    ->setParameters([
+                        'cid'   => $item->getCampaignId(),
+                        'sent'  => 'sent',
+                        'start' => $todayStart,
+                        'end'   => $todayEnd,
+                    ]);
 
-                sleep($delaySeconds);
-            } catch (\Exception $e) {
-                $this->connection->update('custom_email_queue', [
-                    'status' => 'failed',
-                ], ['id' => $item['id']]);
-
-                $output->writeln("<error>Failed sending to contact_id {$item['contact_id']}: {$e->getMessage()}</error>");
+                $alreadySent = (int)$q->getQuery()->getSingleScalarResult();
+                $sentTodayByGroup[$groupKey] = $alreadySent;
             }
         }
 
-        $output->writeln("<info>Queue Processing Completed</info>");
+        foreach ($queueItems as $item) {
+            // Respect start & end dates
+            if ($item->getStartDate() && $now < $item->getStartDate()) {
+                continue;
+            }
+            if ($item->getEndDate() && $now > $item->getEndDate()) {
+                $item->setStatus('failed');
+                $this->em->persist($item);
+                continue;
+            }
+
+            // Respect scheduledAt
+            if ($item->getScheduledAt() && $now < $item->getScheduledAt()) {
+                continue;
+            }
+
+            // Limit check
+            $groupKey   = $item->getCampaignId().':'.((string)($item->getEmailId() ?? 0));
+            $limitToday = $limitTodayByGroup[$groupKey] ?? null;
+            $sentToday  = $sentTodayByGroup[$groupKey] ?? 0;
+
+            if ($limitToday !== null && $sentToday >= $limitToday) {
+                continue;
+            }
+
+            // Load lead & email
+            $lead  = $this->em->getRepository(Lead::class)->find($item->getContactId());
+            $email = $item->getEmailId()
+                ? $this->em->getRepository(Email::class)->find($item->getEmailId())
+                : null;
+
+            if (!$lead) {
+                $item->setStatus('failed');
+                $this->em->persist($item);
+                $output->writeln("<error>Lead {$item->getContactId()} not found.</error>");
+                continue;
+            }
+
+            try {
+                if ($email) {
+                    $this->mailHelper->setEmail($email);
+                    $this->mailHelper->send($lead, $lead->getProfileFields() ?? []);
+                } else {
+                    $this->mailHelper->message->setSubject($item->getSubject());
+                    $this->mailHelper->message->setHtmlBody($item->getBody());
+                    $this->mailHelper->message->setTo($lead->getEmail());
+                    $this->mailHelper->sendMessage();
+                }
+
+                $item->setStatus('sent');
+                $item->setSentAt(new \DateTime());
+                $this->em->persist($item);
+
+                $sentTodayByGroup[$groupKey] = ($sentTodayByGroup[$groupKey] ?? 0) + 1;
+
+                $output->writeln("<info>Sent to lead ID {$lead->getId()} ({$lead->getEmail()})</info>");
+            } catch (\Throwable $e) {
+                $item->setStatus('failed');
+                $this->em->persist($item);
+                $msg = sprintf('Failed to send to lead %d: %s', $lead->getId(), $e->getMessage());
+                $this->logger->error('[CustomEmail] '.$msg, ['exception' => $e]);
+                $output->writeln("<error>$msg</error>");
+                continue;
+            }
+
+            // Throttle
+            $unit  = $item->getSendingSpeedUnit() ?: 'seconds';
+            $value = (int)($item->getSendingSpeedValue() ?: 0);
+            $delay = $unit === 'minutes' ? $value * 60 : $value;
+
+            if ($delay > 0) {
+                sleep($delay);
+            }
+        }
+
+        $this->em->flush();
+        $output->writeln('<info>Queue processing finished.</info>');
+
         return Command::SUCCESS;
     }
 }

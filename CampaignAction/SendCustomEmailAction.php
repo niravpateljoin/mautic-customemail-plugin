@@ -5,15 +5,18 @@ namespace MauticPlugin\CustomEmailBundle\CampaignAction;
 use Mautic\CampaignBundle\Event\CampaignExecutionEvent;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
 use Mautic\EmailBundle\Model\EmailModel;
-use Mautic\LeadBundle\Entity\Lead;
+use MauticPlugin\CustomEmailBundle\Entity\CustomEmailQueue;
+use Doctrine\ORM\EntityManagerInterface;
 
 class SendCustomEmailAction implements EventSubscriberInterface
 {
     private $emailModel;
+    private $em;
 
-    public function __construct(EmailModel $emailModel)
+    public function __construct(EmailModel $emailModel, EntityManagerInterface $em)
     {
         $this->emailModel = $emailModel;
+        $this->em = $em;
     }
 
     public static function getSubscribedEvents()
@@ -26,30 +29,22 @@ class SendCustomEmailAction implements EventSubscriberInterface
     public function execute(CampaignExecutionEvent $event)
     {
         $config  = $event->getConfig();
-        $contact = $event->getContact();
+        $contact = $event->getLead();
 
-        if (!$contact || !$contact->getEmail()) {
-            return;
-        }
+        $queue = new CustomEmailQueue();
+        $queue->setCampaignId($event->getCampaign()->getId());
+        $queue->setContactId($contact->getId());
+        $queue->setEmailId($config['email'] ?? null);
+        $queue->setSubject($config['subject'] ?? '');
+        $queue->setBody($config['body'] ?? '');
+        $queue->setStartDate(!empty($config['startDate']) ? new \DateTime($config['startDate']) : null);
+        $queue->setEndDate(!empty($config['endDate']) ? new \DateTime($config['endDate']) : null);
+        $queue->setSendingSpeedUnit($config['sending_speed_unit'] ?? null);
+        $queue->setSendingSpeedValue($config['sending_speed_value'] ?? null);
+        $queue->setDailyLimit($config['daily_limit'] ?? null);
+        $queue->setDailyIncrement($config['daily_increment'] ?? null);
 
-        // Prepare subject & body from config
-        $subject = $config['subject'] ?? 'Default Subject';
-        $body    = $config['body'] ?? 'Default Body';
-
-        // Fake minimal email array (Mautic EmailModel expects this format)
-        $email = [
-            'subject' => $subject,
-            'customHtml' => $body,
-            'fromName' => 'Custom Plugin',
-            'fromAddress' => 'no-reply@example.com',
-        ];
-
-        // Actually send email
-        $this->emailModel->sendEmail($email, $contact);
-
-        // Log for debugging
-        error_log("✅ Custom Email sent to: " . $contact->getEmail());
-
-        $event->setResult(true);
+        $this->em->persist($queue);
+        $this->em->flush();
     }
 }
